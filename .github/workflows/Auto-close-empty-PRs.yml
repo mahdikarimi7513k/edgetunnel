@@ -1,61 +1,383 @@
-name: Auto-close empty PRs
-
-permissions:
-  issues: write
-  pull-requests: write
+name: Build PodmanBan APK
 
 on:
-  pull_request_target:
-    # 只在新建、重新打开、草稿转正式时检查 PR 说明
-    types:
-      - opened
-      - reopened
-      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: "آدرس سرور (بدون اسلش آخر)"
+        required: true
+        default: "https://ms.payam-coder.ir"
+      app_id:
+        description: "Package Name"
+        required: true
+        default: "ir.payamcoder.podmanban"
+      app_name:
+        description: "نام اپلیکیشن"
+        required: true
+        default: "پودمان‌بان"
+      version_name:
+        description: "شماره نسخه"
+        required: false
+        default: "1.0.0"
+      load_mode:
+        description: "remote = لود مستقیم سایت | local = بیلد داخلی"
+        required: false
+        default: "remote"
 
 jobs:
-  check-pr:
-    name: Close PRs with empty or short descriptions
+  build:
     runs-on: ubuntu-latest
-    # 草稿 PR 先不处理，等作者准备好再检查
-    if: ${{ !github.event.pull_request.draft }}
-
     steps:
-      - name: Close PR when description is empty or too short
-        uses: actions/github-script@v7
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
         with:
-          script: |
-            const pr = context.payload.pull_request;
+          distribution: temurin
+          java-version: "21"
 
-            // 去掉空白和 HTML 注释，避免“看起来写了，实际上没写内容”
-            const description = (pr.body || '')
-              .replace(/<!--[\s\S]*?-->/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim();
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
 
-            const descriptionLength = Array.from(description).length;
-            core.info(`Description length: ${descriptionLength}`);
+      - name: Install required SDK packages
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-34" "build-tools;34.0.0" >/dev/null
 
-            // 说明超过 8 个字符，就视为已经写了基本内容
-            if (descriptionLength > 8) {
-              core.info('Description is long enough. No action needed.');
-              return;
-            }
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y imagemagick
 
-            // 说明为空或太短，先留言提醒，再自动关闭 PR
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              body: [
-                '🤖 这个 PR 因为说明为空，或说明过短，已被自动关闭。',
-                '',
-                '请补充这次改了什么、为什么要改，再重新提交 PR。',
-              ].join('\n'),
-            });
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              state: 'closed',
-            });
+      - name: Install client deps
+        working-directory: client
+        run: |
+          npm install -g npm@latest
+          npm install
+
+      - name: Build web assets
+        working-directory: client
+        run: npm run build
+        env:
+          VITE_API_BASE: ${{ inputs.api_base }}
+
+      - name: Detect webDir
+        working-directory: client
+        run: |
+          if [ -d dist ]; then W=dist
+          elif [ -d build ]; then W=build
+          elif [ -d out ]; then W=out
+          else W=dist; fi
+          echo "WEB_DIR=$W" >> $GITHUB_ENV
+          echo "webDir = $W"
+
+      - name: Write Capacitor config (package name + cookies)
+        working-directory: client
+        env:
+          APP_ID: ${{ inputs.app_id }}
+          APP_NAME: ${{ inputs.app_name }}
+          WEB_DIR: ${{ env.WEB_DIR }}
+          API_BASE: ${{ inputs.api_base }}
+          LOAD_MODE: ${{ inputs.load_mode }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os
+          cfg = {}
+          if os.path.exists('capacitor.config.json'):
+              with open('capacitor.config.json', encoding='utf-8') as f:
+                  cfg = json.load(f)
+          elif os.path.exists('capacitor.config.ts'):
+              os.rename('capacitor.config.ts', 'capacitor.config.ts.bak')
+          cfg['appId'] = os.environ['APP_ID']
+          cfg['appName'] = os.environ['APP_NAME']
+          cfg['webDir'] = os.environ['WEB_DIR']
+          # امنیت: بدون محتوای میکس (http)، بدون دیباگ وب‌ویو در ریلیز
+          cfg['android'] = {**(cfg.get('android') or {}),
+                            'allowMixedContent': False,
+                            'webContentsDebuggingEnabled': False}
+          # حیاتی برای لاگین: بدون این دو، document.cookie خالی است،
+          # هدر x-csrf-token ست نمی‌شود و همه POST/PUT/DELETE ها 403 می‌خورند
+          cfg['plugins'] = {
+              **(cfg.get('plugins') or {}),
+              'CapacitorCookies': {'enabled': True},
+              'CapacitorHttp': {'enabled': True},
+          }
+          # منشأ وب‌ویو اندروید https://localhost می‌شود؛
+          # سرور باید COOKIE_SAMESITE=none (+ Secure اجباری) بدهد
+          server = {**(cfg.get('server') or {}), 'androidScheme': 'https'}
+          server.pop('cleartext', None)
+          if os.environ['LOAD_MODE'] == 'remote':
+              server['url'] = os.environ['API_BASE']
+          else:
+              server.pop('url', None)
+          cfg['server'] = server
+          with open('capacitor.config.json', 'w', encoding='utf-8') as f:
+              json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print('appId =', cfg['appId'], '| mode =', os.environ['LOAD_MODE'])
+          print('plugins =', json.dumps(cfg['plugins']))
+          print('server.url =', server.get('url', '(local assets)'))
+          PYEOF
+
+      - name: Ensure app icon exists (auto-draw if missing)
+        working-directory: client
+        run: |
+          if command -v magick >/dev/null 2>&1; then MX="magick"; else MX="convert"; fi
+          mkdir -p assets
+          if [ ! -f assets/icon.png ]; then
+            echo "🎨 Generating default icon (graduation cap)..."
+            $MX -size 1024x1024 gradient:'#4a9bff-#0a5be0' \
+              -fill white -stroke none \
+              -draw "roundrectangle 322,470 702,742 80,80" \
+              -draw "polygon 512,236 894,420 512,604 130,420" \
+              -draw "rectangle 868,420 896,566" \
+              -draw "circle 882,594 882,622" \
+              -draw "polygon 858,616 906,616 890,712 874,712" \
+              assets/icon.png
+            echo "✅ assets/icon.png generated"
+          else
+            echo "✅ Using committed assets/icon.png"
+          fi
+
+      - name: Add Android platform (fresh)
+        working-directory: client
+        run: |
+          rm -rf android
+          npx cap add android
+
+      - name: Harden manifest (no backup, no cleartext)
+        working-directory: client/android
+        run: |
+          M=app/src/main/AndroidManifest.xml
+          if grep -q 'android:allowBackup' "$M"; then
+            sed -i 's/android:allowBackup="true"/android:allowBackup="false"/' "$M"
+          else
+            sed -i 's/<application /<application android:allowBackup="false" /' "$M"
+          fi
+          if grep -q 'android:usesCleartextTraffic' "$M"; then
+            sed -i 's/android:usesCleartextTraffic="true"/android:usesCleartextTraffic="false"/' "$M"
+          else
+            sed -i 's/<application /<application android:usesCleartextTraffic="false" /' "$M"
+          fi
+          echo "✅ allowBackup=false, usesCleartextTraffic=false"
+
+      - name: Prepare signing keystore + fingerprint
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SEC_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SEC_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SEC_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r ' | base64 -d > /tmp/release.keystore
+            STORE_PASS="$SEC_STORE_PASS"
+            ALIAS_NAME="$SEC_ALIAS"
+            KEY_PASS_VAL="$SEC_KEY_PASS"
+            echo "✅ Using keystore from secrets"
+          else
+            keytool -genkeypair -v -keystore /tmp/release.keystore -alias podmanban -keyalg RSA -keysize 2048 -validity 10000 -storepass podmanban2024 -keypass podmanban2024 -dname "CN=PodmanBan, OU=PayamCoder, O=PayamCoder, L=Tehran, ST=Tehran, C=IR" >/dev/null 2>&1
+            STORE_PASS="podmanban2024"
+            ALIAS_NAME="podmanban"
+            KEY_PASS_VAL="podmanban2024"
+            echo "⚠️ Temporary keystore generated (unsigned identity — set secrets for production)"
+          fi
+
+          LIST_OUT=$(keytool -list -v -keystore /tmp/release.keystore -storepass "$STORE_PASS" -alias "$ALIAS_NAME" 2>&1 || true)
+          FP=$(printf '%s' "$LIST_OUT" | grep -m1 'SHA256:' | sed 's/.*SHA256:[[:space:]]*//' | tr -d ' :' | tr '[:lower:]' '[:upper:]')
+
+          if [ "${#FP}" -ne 64 ]; then
+            echo "❌ Could not read certificate fingerprint"
+            printf '%s\n' "$LIST_OUT" | head -5 || true
+            exit 1
+          fi
+
+          {
+            echo "KEYSTORE_PATH=/tmp/release.keystore"
+            echo "KEYSTORE_PASS=$STORE_PASS"
+            echo "KEY_ALIAS=$ALIAS_NAME"
+            echo "KEY_PASS=$KEY_PASS_VAL"
+            echo "CERT_FP=$FP"
+          } >> "$GITHUB_ENV"
+
+          echo "🔐 Cert fingerprint: $FP"
+
+      - name: Inject anti-tamper signature guard
+        working-directory: client
+        env:
+          APP_ID: ${{ inputs.app_id }}
+          CERT_FP: ${{ env.CERT_FP }}
+        run: |
+          python3 <<'PYEOF'
+          import os, glob
+
+          fp = os.environ['CERT_FP'].replace(':', '').strip().upper()
+          if len(fp) != 64:
+              raise SystemExit('❌ fingerprint invalid')
+          pkg = os.environ['APP_ID'].strip()
+          digest = bytes.fromhex(fp)
+          arr = ', '.join(str((b ^ 0x5A) & 0xFF) for b in digest)
+
+          base = 'android/app/src/main/java/' + pkg.replace('.', '/')
+          os.makedirs(base, exist_ok=True)
+          for f in glob.glob(base + '/MainActivity.*'):
+              os.remove(f)
+
+          java = r'''
+          package __PKG__;
+
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.Process;
+          import java.security.MessageDigest;
+
+          public class MainActivity extends com.getcapacitor.BridgeActivity {
+
+              private static final int XOR = 0x5A;
+              private static final int[] FP = {__ARR__};
+
+              private boolean ok() {
+                  try {
+                      byte[] raw;
+                      if (Build.VERSION.SDK_INT >= 28) {
+                          PackageInfo p = getPackageManager().getPackageInfo(
+                                  getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+                          raw = p.signingInfo.getApkContentsSigners()[0].toByteArray();
+                      } else {
+                          PackageInfo p = getPackageManager().getPackageInfo(
+                                  getPackageName(), PackageManager.GET_SIGNATURES);
+                          raw = p.signatures[0].toByteArray();
+                      }
+                      byte[] d = MessageDigest.getInstance("SHA-256").digest(raw);
+                      if (d.length != FP.length) return false;
+                      for (int i = 0; i < d.length; i++) {
+                          if (((d[i] ^ XOR) & 0xFF) != FP[i]) return false;
+                      }
+                      return true;
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              private void die() {
+                  finishAffinity();
+                  Process.killProcess(Process.myPid());
+              }
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  if (!ok()) { die(); return; }
+                  super.onCreate(savedInstanceState);
+                  new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                      @Override
+                      public void run() { if (!ok()) die(); }
+                  }, 5000);
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  if (!ok()) { die(); }
+              }
+          }
+          '''
+          java = java.replace('__PKG__', pkg).replace('__ARR__', arr)
+          path = os.path.join(base, 'MainActivity.java')
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(java.strip() + '\n')
+          print('🛡️ Signature guard injected →', path)
+          PYEOF
+
+      - name: Sync Capacitor
+        working-directory: client
+        run: npx cap sync android
+
+      - name: Generate Android icons & splash (ImageMagick)
+        working-directory: client
+        run: |
+          set -e
+          if command -v magick >/dev/null 2>&1; then MX="magick"; else MX="convert"; fi
+          RES=android/app/src/main/res
+          ICON=assets/icon.png
+
+          $MX "$ICON" -resize 1024x1024 \
+            \( -size 1024x1024 xc:none -fill white -draw "roundrectangle 0,0 1023,1023 230,230" \) \
+            -alpha set -compose DstIn -composite /tmp/icon_rounded.png
+
+          for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            den=${pair%%:*}; px=${pair##*:}
+            dir="$RES/mipmap-$den"
+            [ -d "$dir" ] || continue
+            $MX /tmp/icon_rounded.png -resize ${px}x${px} "$dir/ic_launcher.png"
+            $MX /tmp/icon_rounded.png -resize ${px}x${px} "$dir/ic_launcher_round.png"
+            fp=$(( px * 225 / 100 ))
+            inner=$(( fp * 66 / 100 ))
+            $MX -size ${fp}x${fp} xc:none \
+              \( /tmp/icon_rounded.png -resize ${inner}x${inner} \) \
+              -gravity center -compose over -composite "$dir/ic_launcher_foreground.png"
+            echo "  ✔ mipmap-$den"
+          done
+
+          grep -rl "ic_launcher_background" "$RES/values" 2>/dev/null | while read -r bg; do
+            sed -i -E 's/(name="ic_launcher_background">)#[0-9A-Fa-f]+(<)/\1#1B7FF0\2/g' "$bg"
+          done
+
+          find "$RES" -name "splash.png" -type f | while read -r f; do
+            dims=$($MX "$f" -format "%wx%h" info:)
+            W=${dims%x*}; H=${dims#*x}
+            S=$(( ( W < H ? W : H ) * 45 / 100 ))
+            $MX -size ${W}x${H} xc:black \
+              \( /tmp/icon_rounded.png -resize ${S}x${S} \) \
+              -gravity center -compose over -composite "$f"
+            echo "  ✔ $f (${W}x${H})"
+          done
+          echo "✅ All icons & splash generated"
+
+      - name: Set versionName / versionCode
+        working-directory: client/android
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          python3 -c "
+          import re, os
+          p = 'app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'versionName\s+\"[^\"]*\"', 'versionName \"%s\"' % os.environ['VERSION_NAME'], s)
+          s = re.sub(r'versionCode\s+\d+', 'versionCode %s' % os.environ['VERSION_CODE'], s)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('version:', os.environ['VERSION_NAME'], '| code:', os.environ['VERSION_CODE'])
+          "
+
+      - name: Build release APK
+        working-directory: client/android
+        run: ./gradlew clean assembleRelease
+
+      - name: Sign APK
+        working-directory: client/android
+        run: |
+          set -e
+          APK=$(find app/build/outputs/apk/release -name "*unsigned*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          fi
+          echo "Signing: $APK"
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          "$BT/zipalign" -f 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks "$KEYSTORE_PATH" --ks-key-alias "$KEY_ALIAS" --ks-pass "pass:$KEYSTORE_PASS" --key-pass "pass:$KEY_PASS" --out signed.apk aligned.apk
+          "$BT/apksigner" verify signed.apk
+          echo "✅ Signed: $(du -h signed.apk | cut -f1)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-ban-release-apk
+          path: client/android/signed.apk
